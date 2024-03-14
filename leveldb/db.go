@@ -8,15 +8,20 @@ package leveldb
 
 import (
 	"container/list"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb/common"
 	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/journal"
@@ -760,8 +765,170 @@ func memGet(mdb *memdb.DB, ikey internalKey, icmp *iComparer) (ok bool, mv []byt
 	return
 }
 
+func SaveCacheStat(endBlockNum uint64, readTrieCleanCacheNum, readTrieDirtyCacheNum, readTrieCleanCacheTime, readTrieDirtyCacheTime int64) {
+
+	common.CacheStatMutex.Lock()
+
+	common.CurrentCacheStat.EndBlockNum = endBlockNum
+	common.CurrentCacheStat.ReadTrieCleanCacheNum = readTrieCleanCacheNum
+	common.CurrentCacheStat.ReadTrieDirtyCacheNum = readTrieDirtyCacheNum
+	common.CurrentCacheStat.ReadTrieCleanCacheTime = readTrieCleanCacheTime
+	common.CurrentCacheStat.ReadTrieDirtyCacheTime = readTrieDirtyCacheTime
+
+	blockNumStr := fmt.Sprintf("%08d", endBlockNum)
+	common.CacheStats[blockNumStr] = common.CurrentCacheStat
+
+	common.CacheStatMutex.Unlock()
+}
+
+func ResetCacheStat(startBlockNum uint64) {
+	common.CacheStatMutex.Lock()
+	common.CurrentCacheStat = common.NewCacheStat()
+	common.CurrentCacheStat.StartBlockNum = startBlockNum
+	common.CacheStatMutex.Unlock()
+}
+
+func PrintTotalCacheStat() {
+	totalCacheStat := common.NewCacheStat()
+
+	mapKeys := make([]string, 0)
+	for k, _ := range common.CacheStats {
+		mapKeys = append(mapKeys, k)
+	}
+	sort.Strings(mapKeys)
+	for _, endBlockNum := range mapKeys {
+		cacheStat := common.CacheStats[endBlockNum]
+		totalCacheStat.Add(cacheStat)
+		// cacheStat.Print()
+	}
+
+	fmt.Println("print total cache stats")
+	totalCacheStat.Print()
+
+	fmt.Println("additional infos")
+	fmt.Println("  MissingReadBlockCnt:", common.MissingReadBlockCnt)
+	fmt.Println("  MissingReadFilterBlockCnt:", common.MissingReadFilterBlockCnt)
+	fmt.Println("  fillCache False cnt:", fillCacheFalseCnt)
+}
+
+func saveReadLogs(position string, startTime time.Time, nodeSize int64, ikeyStr, dataType string) {
+	readTime := time.Since(startTime)
+
+	common.FoundLevelsMutex.Lock()
+	foundLevel, exist := common.FoundLevels[ikeyStr]
+	if !exist {
+		foundLevel = 999
+	}
+	delete(common.FoundLevels, ikeyStr)
+	common.FoundLevelsMutex.Unlock()
+
+	if position == "disk" {
+		if foundLevel < 99 {
+			position = position + "_" + strconv.Itoa(foundLevel)
+		} else if foundLevel == 99 {
+			position = position + "_notFound"
+		} else if foundLevel == 777 {
+			position = position + "_delete"
+		} else if foundLevel == 888 {
+			position = position + "_err"
+		} else if foundLevel == 999 {
+			position = position + "_unknown"
+		} else {
+			fmt.Println("ERROR: impossible found level value")
+			fmt.Println("foundLevel:", foundLevel)
+			os.Exit(1)
+		}
+	}
+
+	common.CacheStatMutex.Lock()
+	common.CurrentCacheStat.ReadNumsPerPosition[position] += 1
+	common.CurrentCacheStat.ReadTimesPerPosition[position] += readTime.Nanoseconds()
+	common.CurrentCacheStat.ReadSizesPerPosition[position] += nodeSize
+
+	common.CurrentCacheStat.ReadNumsPerType[dataType] += 1
+	common.CurrentCacheStat.ReadTimesPerType[dataType] += readTime.Nanoseconds()
+	common.CurrentCacheStat.ReadSizesPerType[dataType] += nodeSize
+	common.CacheStatMutex.Unlock()
+}
+
+// save CacheStats as a json file
+func SaveCacheLogs(filePath, fileNamePrefix string) {
+	// encoding map to json
+	var jsonData []byte
+	var err error
+
+	// save all CacheStats at once
+	jsonData, err = json.MarshalIndent(common.CacheStats, "", "  ")
+	if err != nil {
+		fmt.Println("JSON marshaling error:", err)
+		return
+	}
+
+	// save as a json file
+	mapKeys := make([]string, 0)
+	for k, _ := range common.CacheStats {
+		mapKeys = append(mapKeys, k)
+	}
+	sort.Strings(mapKeys)
+	firstBlockNum := common.CacheStats[mapKeys[0]].StartBlockNum
+	lastBlockNum := common.CacheStats[mapKeys[len(mapKeys)-1]].EndBlockNum
+	fileName := fileNamePrefix + "_" + strconv.FormatUint(firstBlockNum, 10) + "_" + strconv.FormatUint(lastBlockNum, 10) + ".json"
+	err = os.WriteFile(filePath+fileName, jsonData, 0644)
+	if err != nil {
+		fmt.Println("File write error:", err)
+		return
+	}
+	fmt.Println("  saved file name:", fileName)
+}
+
+func PrintReadStats() {
+	fmt.Println("print node read stats of LevelDB (recent)")
+	common.CacheStatMutex.Lock()
+	common.CurrentCacheStat.Print()
+	common.CacheStatMutex.Unlock()
+}
+
+var (
+	fillCacheFalseCnt = 0
+)
+
 func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.ReadOptions) (value []byte, err error) {
+
+	// fmt.Println("db.get() executed !!!")
+	// fmt.Println("try to find key:", hex.EncodeToString(key), "/ len:", len(hex.EncodeToString(key)), "/ fillCache:", !ro.GetDontFillCache())
+
+	foundPosition := ""
+	valueSize := 0
+	dataType := "others"
+	hexKeyLen := len(hex.EncodeToString(key))
+	if hexKeyLen == 64 {
+		// read trie node
+		// key: trie node hash
+		dataType = "trieNode"
+	} else if hexKeyLen == 66 && key[0] == 97 {
+		// read snapshot account
+		// key: SnapshotAccountPrefix ([]byte("a")) + addrHash (ex. 0x61...)
+		dataType = "snapshotAccount"
+	} else if hexKeyLen == 130 && key[0] == 111 {
+		// read snapshot storage
+		// key: SnapshotStoragePrefix ([]byte("o")) + addrHash + storageHash
+		dataType = "snapshotStorage"
+	} else if hexKeyLen == 66 && key[0] == 99 {
+		// read contract code
+		// key: CodePrefix ([]byte("c")) + codeHash (ex. 0x63...)
+		dataType = "contractCode"
+	}
+	readStartTime := time.Now()
 	ikey := makeInternalKey(nil, key, seq, keyTypeSeek)
+	defer func() {
+		// logging db read stats
+		fillCache := !ro.GetDontFillCache()
+		if fillCache {
+			saveReadLogs(foundPosition, readStartTime, int64(valueSize), ikey.String(), dataType)
+		} else {
+			fillCacheFalseCnt++
+		}
+	}()
 
 	if auxm != nil {
 		if ok, mv, me := memGet(auxm, ikey, db.s.icmp); ok {
@@ -777,6 +944,8 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		defer m.decref()
 
 		if ok, mv, me := memGet(m.DB, ikey, db.s.icmp); ok {
+			foundPosition = "memory" // TODO(jmlee): split mutable memdb, immutable memdb
+			valueSize = len(mv)
 			return append([]byte{}, mv...), me
 		}
 	}
@@ -788,6 +957,8 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		// Trigger table compaction.
 		db.compTrigger(db.tcompCmdC)
 	}
+	foundPosition = "disk"
+	valueSize = len(value)
 	return
 }
 
@@ -913,6 +1084,7 @@ func (db *DB) GetSnapshot() (*Snapshot, error) {
 // GetProperty returns value of the given property name.
 //
 // Property names:
+//
 //	leveldb.num-files-at-level{n}
 //		Returns the number of files at level 'n'.
 //	leveldb.stats

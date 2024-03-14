@@ -11,8 +11,10 @@ import (
 	"fmt"
 	"sort"
 	"sync/atomic"
+	"time"
 
 	"github.com/syndtr/goleveldb/leveldb/cache"
+	"github.com/syndtr/goleveldb/leveldb/common"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/storage"
@@ -412,7 +414,14 @@ func (t *tOps) createFrom(src iterator.Iterator) (f *tFile, n int, err error) {
 // Opens table. It returns a cache handle, which should
 // be released after use.
 func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
+	common.CurrentCacheStat.ReadTableRequestNum++
+
+	defer func(start time.Time) {
+		common.CurrentCacheStat.ReadTableTime += time.Since(start).Nanoseconds()
+	}(time.Now())
+
 	ch = t.cache.Get(0, uint64(f.fd.Num), func() (size int, value cache.Value) {
+		common.CurrentCacheStat.ReadTableMissNum++
 		var r storage.Reader
 		r, err = t.s.stor.Open(f.fd)
 		if err != nil {

@@ -10,13 +10,16 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/golang/snappy"
 
 	"github.com/syndtr/goleveldb/leveldb/cache"
+	"github.com/syndtr/goleveldb/leveldb/common"
 	"github.com/syndtr/goleveldb/leveldb/comparer"
 	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
@@ -622,9 +625,16 @@ func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool)
 			ch  *cache.Handle
 		)
 		if fillCache {
+			common.CurrentCacheStat.ReadBlockRequestNum++
+			// Track the amount of read time
+			defer func(start time.Time) {
+				common.CurrentCacheStat.ReadBlockTime += time.Since(start).Nanoseconds()
+			}(time.Now())
+
 			ch = r.cache.Get(bh.offset, func() (size int, value cache.Value) {
 				var b *block
 				b, err = r.readBlock(bh, verifyChecksum)
+				common.CurrentCacheStat.ReadBlockMissNum++
 				if err != nil {
 					return 0, nil
 				}
@@ -645,7 +655,12 @@ func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool)
 		}
 	}
 
+	// readBlock() cannot be executed more than once in readBlockCached()
+	// for trie node read, fillCache is true
+	// this readBlock might be for compaction, when ch & err are nil and fillCache is false (TODO(jmlee): check this is correct)
 	b, err := r.readBlock(bh, verifyChecksum)
+	common.MissingReadBlockCnt++
+
 	return b, b, err
 }
 
@@ -680,9 +695,16 @@ func (r *Reader) readFilterBlockCached(bh blockHandle, fillCache bool) (*filterB
 			ch  *cache.Handle
 		)
 		if fillCache {
+			common.CurrentCacheStat.ReadFilterRequestNum++
+			// Track the amount of read time
+			defer func(start time.Time) {
+				common.CurrentCacheStat.ReadFilterTime += time.Since(start).Nanoseconds()
+			}(time.Now())
+
 			ch = r.cache.Get(bh.offset, func() (size int, value cache.Value) {
 				var b *filterBlock
 				b, err = r.readFilterBlock(bh)
+				common.CurrentCacheStat.ReadFilterMissNum++
 				if err != nil {
 					return 0, nil
 				}
@@ -704,6 +726,7 @@ func (r *Reader) readFilterBlockCached(bh blockHandle, fillCache bool) (*filterB
 	}
 
 	b, err := r.readFilterBlock(bh)
+	common.MissingReadFilterBlockCnt++ // this seems not being executed
 	return b, b, err
 }
 

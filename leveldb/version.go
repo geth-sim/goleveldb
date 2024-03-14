@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/syndtr/goleveldb/leveldb/common"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -144,6 +145,7 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 	}
 
 	ukey := ikey.ukey()
+	ikeyStr := ikey.String()
 	sampleSeeks := !v.s.o.GetDisableSeeksCompaction()
 
 	var (
@@ -183,9 +185,15 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 		switch ferr {
 		case nil:
 		case ErrNotFound:
+			common.FoundLevelsMutex.Lock()
+			common.FoundLevels[ikeyStr] = 99
+			common.FoundLevelsMutex.Unlock()
 			return true
 		default:
 			err = ferr
+			common.FoundLevelsMutex.Lock()
+			common.FoundLevels[ikeyStr] = 888
+			common.FoundLevelsMutex.Unlock()
 			return false
 		}
 
@@ -202,9 +210,16 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 				} else {
 					switch fkt {
 					case keyTypeVal:
+						// found value at level >= 1
+						common.FoundLevelsMutex.Lock()
+						common.FoundLevels[ikeyStr] = level
+						common.FoundLevelsMutex.Unlock()
 						value = fval
 						err = nil
 					case keyTypeDel:
+						common.FoundLevelsMutex.Lock()
+						common.FoundLevels[ikeyStr] = 777 // TODO(jmlee): this key will be deleted, replace 777 with level
+						common.FoundLevelsMutex.Unlock()
 					default:
 						panic("leveldb: invalid internalKey type")
 					}
@@ -213,6 +228,9 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 			}
 		} else {
 			err = fkerr
+			common.FoundLevelsMutex.Lock()
+			common.FoundLevels[ikeyStr] = 888
+			common.FoundLevelsMutex.Unlock()
 			return false
 		}
 
@@ -221,9 +239,16 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 		if zfound {
 			switch zkt {
 			case keyTypeVal:
+				// found value at level == 0
+				common.FoundLevelsMutex.Lock()
+				common.FoundLevels[ikeyStr] = level
+				common.FoundLevelsMutex.Unlock()
 				value = zval
 				err = nil
 			case keyTypeDel:
+				common.FoundLevelsMutex.Lock()
+				common.FoundLevels[ikeyStr] = 777 // TODO(jmlee): this key will be deleted, should I replace 777 with level?
+				common.FoundLevelsMutex.Unlock()
 			default:
 				panic("leveldb: invalid internalKey type")
 			}
@@ -235,6 +260,12 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 
 	if tseek && tset.table.consumeSeek() <= 0 {
 		tcomp = atomic.CompareAndSwapPointer(&v.cSeek, nil, unsafe.Pointer(tset))
+	}
+
+	if err == ErrNotFound {
+		common.FoundLevelsMutex.Lock()
+		common.FoundLevels[ikeyStr] = 99
+		common.FoundLevelsMutex.Unlock()
 	}
 
 	return

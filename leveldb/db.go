@@ -765,6 +765,11 @@ func memGet(mdb *memdb.DB, ikey internalKey, icmp *iComparer) (ok bool, mv []byt
 	return
 }
 
+const (
+	// this branch is now logging read stats or not ("benchmark")
+	IsLogging = true
+)
+
 func SaveCacheStat(endBlockNum uint64, readTrieCleanCacheNum, readTrieDirtyCacheNum, readTrieCleanCacheTime, readTrieDirtyCacheTime int64) {
 
 	common.CacheStatMutex.Lock()

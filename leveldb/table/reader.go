@@ -10,7 +10,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
 	"sort"
 	"strings"
 	"sync"

@@ -770,15 +770,17 @@ const (
 	IsLogging = true
 )
 
-func SaveCacheStat(endBlockNum uint64, readTrieCleanCacheNum, readTrieDirtyCacheNum, readTrieCleanCacheTime, readTrieDirtyCacheTime int64) {
+func SaveCacheStat(endBlockNum uint64, nums, times, sizes map[string]int64, depthSum int64) {
 
 	common.CacheStatMutex.Lock()
 
 	common.CurrentCacheStat.EndBlockNum = endBlockNum
-	common.CurrentCacheStat.ReadTrieCleanCacheNum = readTrieCleanCacheNum
-	common.CurrentCacheStat.ReadTrieDirtyCacheNum = readTrieDirtyCacheNum
-	common.CurrentCacheStat.ReadTrieCleanCacheTime = readTrieCleanCacheTime
-	common.CurrentCacheStat.ReadTrieDirtyCacheTime = readTrieDirtyCacheTime
+	for k, v := range nums {
+		common.CurrentCacheStat.GethReadNumsPerPosition[k] = v
+		common.CurrentCacheStat.GethReadTimesPerPosition[k] = times[k]
+		common.CurrentCacheStat.GethReadSizesPerPosition[k] = sizes[k]
+	}
+	common.CurrentCacheStat.GethDiffDepthSum = depthSum
 
 	blockNumStr := fmt.Sprintf("%08d", endBlockNum)
 	common.CacheStats[blockNumStr] = common.CurrentCacheStat
@@ -874,6 +876,10 @@ func SaveCacheLogs(filePath, fileNamePrefix string) {
 	for k, _ := range common.CacheStats {
 		mapKeys = append(mapKeys, k)
 	}
+	if len(mapKeys) == 0 {
+		fmt.Println("there is no CacheStats to save")
+		return
+	}
 	sort.Strings(mapKeys)
 	firstBlockNum := common.CacheStats[mapKeys[0]].StartBlockNum
 	lastBlockNum := common.CacheStats[mapKeys[len(mapKeys)-1]].EndBlockNum
@@ -910,6 +916,9 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		// read trie node
 		// key: trie node hash
 		dataType = "trieNode"
+
+		// TODO(jmlee): consider path-based db and snapshot
+
 	} else if hexKeyLen == 66 && key[0] == 97 {
 		// read snapshot account
 		// key: SnapshotAccountPrefix ([]byte("a")) + addrHash (ex. 0x61...)

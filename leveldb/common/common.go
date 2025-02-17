@@ -30,13 +30,19 @@ type CacheStat struct {
 	EndBlockNum   uint64
 
 	//
-	// cache stats from Geth's trie
+	// trie node read stats in Geth's triedb (hash-based or path-based)
 	//
 
+	// TODO(jmlee): deprecate these later
 	ReadTrieCleanCacheNum  int64 // # of trie nodes read from clean cache of geth's trie
 	ReadTrieCleanCacheTime int64
 	ReadTrieDirtyCacheNum  int64 // # of trie nodes read from dirty cache of geth's trie
 	ReadTrieDirtyCacheTime int64
+
+	GethReadNumsPerPosition  map[string]int64
+	GethReadTimesPerPosition map[string]int64
+	GethReadSizesPerPosition map[string]int64
+	GethDiffDepthSum         int64 // sum of depth of diff layers in path-based db
 
 	//
 	// cache stats in leveldb
@@ -65,6 +71,9 @@ type CacheStat struct {
 
 func NewCacheStat() *CacheStat {
 	cs := new(CacheStat)
+	cs.GethReadNumsPerPosition = make(map[string]int64)
+	cs.GethReadTimesPerPosition = make(map[string]int64)
+	cs.GethReadSizesPerPosition = make(map[string]int64)
 	cs.ReadNumsPerPosition = make(map[string]int64)
 	cs.ReadTimesPerPosition = make(map[string]int64)
 	cs.ReadSizesPerPosition = make(map[string]int64)
@@ -91,6 +100,12 @@ func (cs *CacheStat) Add(otherCS *CacheStat) {
 	cs.ReadTrieDirtyCacheNum += otherCS.ReadTrieDirtyCacheNum
 	cs.ReadTrieDirtyCacheTime += otherCS.ReadTrieDirtyCacheTime
 
+	for k, v := range otherCS.GethReadNumsPerPosition {
+		cs.GethReadNumsPerPosition[k] += v
+		cs.GethReadTimesPerPosition[k] += otherCS.GethReadTimesPerPosition[k]
+		cs.GethReadSizesPerPosition[k] += otherCS.GethReadSizesPerPosition[k]
+	}
+	cs.GethDiffDepthSum += otherCS.GethDiffDepthSum
 	for k, v := range otherCS.ReadNumsPerPosition {
 		cs.ReadNumsPerPosition[k] += v
 		cs.ReadTimesPerPosition[k] += otherCS.ReadTimesPerPosition[k]
@@ -181,20 +196,23 @@ func (cs *CacheStat) Print() {
 	//
 
 	fmt.Println("print trie node read stats in Geth")
-	if cs.ReadTrieCleanCacheNum > 0 {
-		fmt.Println("  at position clean -> avg:", cs.ReadTrieCleanCacheTime/cs.ReadTrieCleanCacheNum, "ns ( cnt:", cs.ReadTrieCleanCacheNum, "/ time:", cs.ReadTrieCleanCacheTime, ")")
+	mapKeys = make([]string, 0)
+	for k, _ := range cs.GethReadNumsPerPosition {
+		mapKeys = append(mapKeys, k)
 	}
-	if cs.ReadTrieDirtyCacheNum > 0 {
-		fmt.Println("  at position cirty -> avg:", cs.ReadTrieDirtyCacheTime/cs.ReadTrieDirtyCacheNum, "ns ( cnt:", cs.ReadTrieDirtyCacheNum, "/ time:", cs.ReadTrieDirtyCacheTime, ")")
+	sort.Strings(mapKeys)
+	totalCnt := int64(0)
+	totalTime := int64(0)
+	for _, position := range mapKeys {
+		fmt.Println("  at position", position, "-> avg:", cs.GethReadTimesPerPosition[position]/cs.GethReadNumsPerPosition[position], "ns (cnt:", cs.GethReadNumsPerPosition[position], "/ time:", cs.GethReadTimesPerPosition[position], "ns / size:", cs.GethReadSizesPerPosition[position], "B )")
+		totalCnt += cs.GethReadNumsPerPosition[position]
+		totalTime += cs.GethReadTimesPerPosition[position]
+		if position == "diff" {
+			fmt.Println("    -> avg depth:", float64(cs.GethDiffDepthSum)/float64(cs.GethReadNumsPerPosition[position]), "( sum:", cs.GethDiffDepthSum, "/ cnt:", cs.GethReadNumsPerPosition[position], ")")
+		}
 	}
-	if cs.ReadNumsPerType["trieNode"] > 0 {
-		dataType := "trieNode"
-		fmt.Println("  at position leveldb -> avg:", cs.ReadTimesPerType[dataType]/cs.ReadNumsPerType[dataType], "ns (cnt:", cs.ReadNumsPerType[dataType], "/ time:", cs.ReadTimesPerType[dataType], "ns / size:", cs.ReadSizesPerType[dataType], "B )")
-	}
-	totalCnt := cs.ReadTrieCleanCacheNum + cs.ReadTrieDirtyCacheNum + cs.ReadNumsPerType["trieNode"]
-	totalTime := cs.ReadTrieCleanCacheTime + cs.ReadTrieDirtyCacheTime + cs.ReadTimesPerType["trieNode"]
 	if totalCnt > 0 {
 		fmt.Println("    => total -> avg:", totalTime/totalCnt, "ns ( cnt:", totalCnt, "/ time:", totalTime, ")")
-		fmt.Println("    => node cache hit rate:", 100-float64(cs.ReadNumsPerType["trieNode"])/float64(totalCnt)*100, "%")
+		fmt.Println("    => node cache hit rate:", 100-float64(cs.GethReadNumsPerPosition["disk"])/float64(totalCnt)*100, "%")
 	}
 }

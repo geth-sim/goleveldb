@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/golang/snappy"
 
 	"github.com/syndtr/goleveldb/leveldb/cache"
+	"github.com/syndtr/goleveldb/leveldb/common"
 	"github.com/syndtr/goleveldb/leveldb/comparer"
 	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/filter"
@@ -621,8 +623,10 @@ func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool)
 			err error
 			ch  *cache.Handle
 		)
+		cacheMiss := false
 		if fillCache {
 			ch = r.cache.Get(bh.offset, func() (size int, value cache.Value) {
+				cacheMiss = true
 				var b *block
 				b, err = r.readBlock(bh, verifyChecksum)
 				if err != nil {
@@ -639,6 +643,14 @@ func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool)
 				ch.Release()
 				return nil, nil, errors.New("leveldb/table: inconsistent block type")
 			}
+
+			blockKind := r.blockKind(bh)
+			if cacheMiss {
+				common.MyReadStats.AddSpecificCacheMiss(blockKind)
+			} else {
+				common.MyReadStats.AddSpecificCacheHit(blockKind)
+			}
+
 			return b, ch, err
 		} else if err != nil {
 			return nil, nil, err
@@ -679,8 +691,10 @@ func (r *Reader) readFilterBlockCached(bh blockHandle, fillCache bool) (*filterB
 			err error
 			ch  *cache.Handle
 		)
+		cacheMiss := false
 		if fillCache {
 			ch = r.cache.Get(bh.offset, func() (size int, value cache.Value) {
+				cacheMiss = true
 				var b *filterBlock
 				b, err = r.readFilterBlock(bh)
 				if err != nil {
@@ -697,6 +711,18 @@ func (r *Reader) readFilterBlockCached(bh blockHandle, fillCache bool) (*filterB
 				ch.Release()
 				return nil, nil, errors.New("leveldb/table: inconsistent block type")
 			}
+
+			blockKind := r.blockKind(bh)
+			if cacheMiss {
+				common.MyReadStats.AddSpecificCacheMiss(blockKind)
+			} else {
+				common.MyReadStats.AddSpecificCacheHit(blockKind)
+			}
+			if blockKind != "filter-block" {
+				fmt.Println("ERROR: in readFilterBlockCached -> blockKind:", blockKind)
+				os.Exit(1)
+			}
+
 			return b, ch, err
 		} else if err != nil {
 			return nil, nil, err

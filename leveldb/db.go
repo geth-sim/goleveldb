@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/syndtr/goleveldb/leveldb/common"
 	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/journal"
@@ -773,6 +774,14 @@ func PrintTotalCacheStat()                          {}
 func SaveCacheLogs(filePath, fileNamePrefix string) {}
 func PrintReadStats()                               {}
 
+func PrintMyReadStats() {
+	common.MyReadStats.PrintStats()
+}
+
+func SaveMyReadStats(filePath string) {
+	common.MyReadStats.SaveToFile(filePath)
+}
+
 func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.ReadOptions) (value []byte, err error) {
 	ikey := makeInternalKey(nil, key, seq, keyTypeSeek)
 
@@ -783,14 +792,27 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 	}
 
 	em, fm := db.getMems()
-	for _, m := range [...]*memDB{em, fm} {
+	for i, m := range [...]*memDB{em, fm} {
 		if m == nil {
 			continue
 		}
 		defer m.decref()
 
 		if ok, mv, me := memGet(m.DB, ikey, db.s.icmp); ok {
+			// count real read
+			if i == 0 {
+				common.MyReadStats.AddRealMem("mem")
+			} else {
+				common.MyReadStats.AddRealMem("imm")
+			}
 			return append([]byte{}, mv...), me
+		} else {
+			// count fake read
+			if i == 0 {
+				common.MyReadStats.AddFakeMem("mem")
+			} else {
+				common.MyReadStats.AddFakeMem("imm")
+			}
 		}
 	}
 
@@ -801,6 +823,11 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		// Trigger table compaction.
 		db.compTrigger(db.tcompCmdC)
 	}
+
+	if err == ErrNotFound {
+		common.MyReadStats.AddNotFound()
+	}
+
 	return
 }
 
@@ -858,6 +885,8 @@ func (db *DB) Get(key []byte, ro *opt.ReadOptions) (value []byte, err error) {
 	if err != nil {
 		return
 	}
+
+	common.MyReadStats.AddReadRequest()
 
 	se := db.acquireSnapshot()
 	defer db.releaseSnapshot(se)

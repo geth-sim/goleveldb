@@ -12,6 +12,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/syndtr/goleveldb/leveldb/common"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -159,9 +160,17 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 
 	err = ErrNotFound
 
+	level0SSTableCount := int64(0)
+	foundInLevel0 := false
+
 	// Since entries never hop across level, finding key/value
 	// in smaller level make later levels irrelevant.
 	v.walkOverlapping(aux, ikey, func(level int, t *tFile) bool {
+		// --- Level 0 attempt count ---
+		if level == 0 {
+			level0SSTableCount++
+		}
+
 		if sampleSeeks && level >= 0 && !tseek {
 			if tset == nil {
 				tset = &tSet{level, t}
@@ -183,6 +192,9 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 		switch ferr {
 		case nil:
 		case ErrNotFound:
+			if level != 0 {
+				common.MyReadStats.AddFakeLevel(level)
+			}
 			return true
 		default:
 			err = ferr
@@ -191,6 +203,14 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 
 		if fukey, fseq, fkt, fkerr := parseInternalKey(fikey); fkerr == nil {
 			if v.s.icmp.uCompare(ukey, fukey) == 0 {
+				// Found!
+				// --- Set flag when found in Level 0 ---
+				if level == 0 {
+					foundInLevel0 = true
+				} else {
+					common.MyReadStats.AddRealLevel(level)
+				}
+
 				// Level <= 0 may overlaps each-other.
 				if level <= 0 {
 					if fseq >= zseq {
@@ -210,8 +230,14 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 					}
 					return false
 				}
+			} else {
+				// Key exists, but ukey does not match → fake
+				if level != 0 {
+					common.MyReadStats.AddFakeLevel(level)
+				}
 			}
 		} else {
+			// Failed to parse internal key (possible data corruption)
 			err = fkerr
 			return false
 		}
@@ -232,6 +258,17 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 
 		return true
 	})
+
+	// Level 0 attempt/result counting (once per request)
+	if level0SSTableCount > 0 {
+		if foundInLevel0 {
+			common.MyReadStats.AddRealLevel0Attempt()
+			common.MyReadStats.AddRealLevel0(level0SSTableCount)
+		} else {
+			common.MyReadStats.AddFakeLevel0Attempt()
+			common.MyReadStats.AddFakeLevel0(level0SSTableCount)
+		}
+	}
 
 	if tseek && tset.table.consumeSeek() <= 0 {
 		tcomp = atomic.CompareAndSwapPointer(&v.cSeek, nil, unsafe.Pointer(tset))

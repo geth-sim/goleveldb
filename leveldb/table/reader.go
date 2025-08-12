@@ -875,13 +875,18 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 	}
 
 	// The filter should only used for exact match.
+	wasBloomHit := false
 	if filtered && r.filter != nil {
 		filterBlock, frel, ferr := r.getFilterBlock(true)
 		if ferr == nil {
 			if !filterBlock.contains(r.filter, dataBH.offset, key) {
+				common.MyReadStats.AddBloomMiss()
 				frel.Release()
 				return nil, nil, ErrNotFound
 			}
+			// Bloom filter hit!
+			common.MyReadStats.AddBloomHit()
+        	wasBloomHit = true // <--- flag
 			frel.Release()
 		} else if !errors.IsCorrupted(ferr) {
 			return nil, nil, ferr
@@ -890,6 +895,10 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 
 	data := r.getDataIter(dataBH, nil, r.verifyChecksum, !ro.GetDontFillCache())
 	if !data.Seek(key) {
+		if wasBloomHit {
+			common.MyReadStats.AddBloomFalsePositive()
+		}
+		
 		data.Release()
 		if err = data.Error(); err != nil {
 			return

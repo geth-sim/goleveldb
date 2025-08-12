@@ -33,6 +33,11 @@ type ReadStats struct {
 	// cache hit/miss counts
 	CacheHitCounts  map[string]int64
 	CacheMissCounts map[string]int64
+
+	// bloom filter hit/miss counts
+	BloomHitCount           int64
+	BloomMissCount          int64
+	BloomFalsePositiveCount int64
 }
 
 func NewReadStats() *ReadStats {
@@ -130,6 +135,24 @@ func (rs *ReadStats) AddSpecificCacheMiss(blockKind string) {
 	rs.CacheMissCounts[blockKind]++
 }
 
+func (rs *ReadStats) AddBloomHit() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.BloomHitCount++
+}
+
+func (rs *ReadStats) AddBloomMiss() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.BloomMissCount++
+}
+
+func (rs *ReadStats) AddBloomFalsePositive() {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	rs.BloomFalsePositiveCount++
+}
+
 func (rs *ReadStats) PrintStats() {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
@@ -221,59 +244,78 @@ func (rs *ReadStats) PrintStats() {
 	}
 
 	fmt.Println("\nDetailed Cache Stats:")
-    // collect and sort blockKind
-    var blockKinds []string
-    for kind := range rs.CacheHitCounts {
-        blockKinds = append(blockKinds, kind)
-    }
-    for kind := range rs.CacheMissCounts {
-        // avoid duplication
-        found := false
-        for _, k := range blockKinds {
-            if k == kind {
-                found = true
-                break
-            }
-        }
-        if !found {
-            blockKinds = append(blockKinds, kind)
-        }
-    }
-    sort.Strings(blockKinds)
+	// collect and sort blockKind
+	var blockKinds []string
+	for kind := range rs.CacheHitCounts {
+		blockKinds = append(blockKinds, kind)
+	}
+	for kind := range rs.CacheMissCounts {
+		// avoid duplication
+		found := false
+		for _, k := range blockKinds {
+			if k == kind {
+				found = true
+				break
+			}
+		}
+		if !found {
+			blockKinds = append(blockKinds, kind)
+		}
+	}
+	sort.Strings(blockKinds)
 
-    for _, kind := range blockKinds {
-        hits := rs.CacheHitCounts[kind]
-        misses := rs.CacheMissCounts[kind]
-        total := hits + misses
-        hitRate := 0.0
-        if total > 0 {
-            hitRate = float64(hits) / float64(total) * 100.0
-        }
-        fmt.Printf("  %-12s  Hit: %8d   Miss: %8d   HitRate: %6.2f%%\n", kind, hits, misses, hitRate)
-    }
+	for _, kind := range blockKinds {
+		hits := rs.CacheHitCounts[kind]
+		misses := rs.CacheMissCounts[kind]
+		total := hits + misses
+		hitRate := 0.0
+		if total > 0 {
+			hitRate = float64(hits) / float64(total) * 100.0
+		}
+		fmt.Printf("  %-12s  Hit: %8d   Miss: %8d   HitRate: %6.2f%%\n", kind, hits, misses, hitRate)
+	}
+
+	// bloom filter stats
+	fmt.Println("\nBloom filter Stats:")
+	bloomTotalChecks := rs.BloomHitCount + rs.BloomMissCount
+	bloomHitRate := float64(0)
+	bloomMissRate := float64(0)
+	bloomFalsePositiveRate := float64(0)
+	if bloomTotalChecks > 0 {
+		bloomHitRate = float64(rs.BloomHitCount) / float64(bloomTotalChecks)
+		bloomMissRate = float64(rs.BloomMissCount) / float64(bloomTotalChecks)
+	}
+	if rs.BloomHitCount > 0 {
+		bloomFalsePositiveRate = float64(rs.BloomFalsePositiveCount) / float64(rs.BloomHitCount)
+	}
+	fmt.Printf("  Bloom Filter Total Checks     : %d\n", bloomTotalChecks)
+	fmt.Printf("  Bloom Hit Count             : %d (Hit Rate: %.4f)\n", rs.BloomHitCount, bloomHitRate)
+	fmt.Printf("  Bloom Miss Count            : %d (Miss Rate: %.4f)\n", rs.BloomMissCount, bloomMissRate)
+	fmt.Printf("  Bloom False Positive Count  : %d (False Positive Rate among hits: %.4f)\n",
+		rs.BloomFalsePositiveCount, bloomFalsePositiveRate)
 
 	fmt.Println("\nImportant Stats:")
-    fakeNon0LevelSum := int64(0)
-    for level, cnt := range rs.FakeLevels {
-        if level != 0 {
-            fakeNon0LevelSum += cnt
-        }
-    }
-    fakeLevelRatio := 0.0
-    if rs.ReadRequestCount > 0 {
-        fakeLevelRatio = float64(fakeNon0LevelSum) / float64(rs.ReadRequestCount)
-    }
+	fakeNon0LevelSum := int64(0)
+	for level, cnt := range rs.FakeLevels {
+		if level != 0 {
+			fakeNon0LevelSum += cnt
+		}
+	}
+	fakeLevelRatio := 0.0
+	if rs.ReadRequestCount > 0 {
+		fakeLevelRatio = float64(fakeNon0LevelSum) / float64(rs.ReadRequestCount)
+	}
 
-    hits := rs.CacheHitCounts["data-block"]
-    misses := rs.CacheMissCounts["data-block"]
-    total := hits + misses
-    hitRate := 0.0
-    if total > 0 {
-        hitRate = float64(hits) / float64(total) * 100.0
-    }
+	hits := rs.CacheHitCounts["data-block"]
+	misses := rs.CacheMissCounts["data-block"]
+	total := hits + misses
+	hitRate := 0.0
+	if total > 0 {
+		hitRate = float64(hits) / float64(total) * 100.0
+	}
 
-    fmt.Printf("  FakeReads(Level>0) / Read: %.4f (%d / %d)\n", fakeLevelRatio, fakeNon0LevelSum, rs.ReadRequestCount)
-    fmt.Printf("  Data-block cache hit rate: %.2f%% (%d / %d)\n", hitRate, hits, total)
+	fmt.Printf("  FakeReads(Level>0) / Read: %.4f (%d / %d)\n", fakeLevelRatio, fakeNon0LevelSum, rs.ReadRequestCount)
+	fmt.Printf("  Data-block cache hit rate: %.2f%% (%d / %d)\n", hitRate, hits, total)
 
 	fmt.Println("==================================")
 }

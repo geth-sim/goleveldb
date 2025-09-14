@@ -782,6 +782,25 @@ func SaveMyReadStats(filePath string) {
 	common.MyReadStats.SaveToFile(filePath)
 }
 
+func (db *DB) CollectSSTStats(filePath string) {
+	fmt.Println("CollectSSTStats() executed in leveldb/db.go")
+	v := db.s.version()
+	stats, err := v.CollectSSTStats(nil)
+	if err != nil {
+		// handle error
+		fmt.Println("err1:", err)
+		os.Exit(1)
+	}
+
+	// Pretty JSON
+	data, err := json.MarshalIndent(stats, "", "  ")
+	if err != nil {
+		fmt.Println("err2:", err)
+		os.Exit(1)
+	}
+	os.WriteFile(filePath, data, 0644)
+}
+
 func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.ReadOptions) (value []byte, err error) {
 	ikey := makeInternalKey(nil, key, seq, keyTypeSeek)
 

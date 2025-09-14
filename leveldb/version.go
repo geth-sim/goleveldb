@@ -13,6 +13,7 @@ import (
 	"unsafe"
 
 	"github.com/syndtr/goleveldb/leveldb/common"
+	"github.com/syndtr/goleveldb/leveldb/errors"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
 	"github.com/syndtr/goleveldb/leveldb/opt"
 	"github.com/syndtr/goleveldb/leveldb/util"
@@ -438,6 +439,193 @@ func (v *version) computeCompaction() {
 
 func (v *version) needCompaction() bool {
 	return v.cScore >= 1 || atomic.LoadPointer(&v.cSeek) != nil
+}
+
+// ---------- Data Models ----------
+
+// Per-table (SST) stats.
+type TableStats struct {
+	Level           int    `json:"level"`
+	FileNum         int64  `json:"file_num"`
+	FileSizeBytes   int64  `json:"file_size_bytes"`
+	MinUserKeyHex   string `json:"min_ukey_hex"`
+	MaxUserKeyHex   string `json:"max_ukey_hex"`
+	EntriesTotal    int64  `json:"entries_total"`
+	EntriesVal      int64  `json:"entries_val"`
+	EntriesDel      int64  `json:"entries_del"`
+	AvgKeyLen       int64  `json:"avg_key_len"`
+	AvgValueLen     int64  `json:"avg_value_len"`
+	IterError       string `json:"iter_error,omitempty"`
+	CollectedAtUnix int64  `json:"collected_at_unix"`
+}
+
+// Per-level aggregated stats.
+type LevelStats struct {
+	Level         int    `json:"level"`
+	SSTCount      int    `json:"sst_count"`
+	MinUserKeyHex string `json:"min_ukey_hex"`
+	MaxUserKeyHex string `json:"max_ukey_hex"`
+	EntriesTotal  int64  `json:"entries_total"`
+	EntriesVal    int64  `json:"entries_val"`
+	EntriesDel    int64  `json:"entries_del"`
+}
+
+// Whole snapshot.
+type VersionStats struct {
+	Levels []LevelStats `json:"levels"`
+	Tables []TableStats `json:"tables"`
+}
+
+// ---------- Helpers ----------
+
+// hexify returns a short hex string for a user key.
+// You can change to full hex if you prefer.
+func hexify(b []byte) string {
+	// const max = 64 // limit for logging; adjust if needed
+	// hex := fmt.Sprintf("%x", b)
+	// if len(hex) > max {
+	// 	return hex[:max] + "..."
+	// }
+	// return hex
+
+	return fmt.Sprintf("%x", b) // full hex string
+}
+
+// mergeLevelRange updates the level-wide min/max by comparing user keys.
+func (v *version) mergeLevelRange(level int, curMin, curMax []byte, t *tFile) (minOut, maxOut []byte) {
+	// NOTE: v.s.icmp.uCompare compares user keys
+	tMin := t.imin.ukey()
+	tMax := t.imax.ukey()
+	minOut = curMin
+	maxOut = curMax
+	if minOut == nil || v.s.icmp.uCompare(tMin, minOut) < 0 {
+		minOut = tMin
+	}
+	if maxOut == nil || v.s.icmp.uCompare(tMax, maxOut) > 0 {
+		maxOut = tMax
+	}
+	return
+}
+
+// scanTable counts entries in an SST by iterating all internal keys.
+// Use DontFillCache to avoid polluting block cache.
+func (v *version) scanTable(t *tFile, ro *opt.ReadOptions) (entriesTotal, entriesVal, entriesDel, avgKey, avgVal int64, iterErr error) {
+	// Ensure we don't fill cache by default for stats scans.
+	var localRO opt.ReadOptions
+	if ro != nil {
+		localRO = *ro
+	}
+	localRO.DontFillCache = true
+
+	it := v.s.tops.newIterator(t, nil, &localRO)
+	defer it.Release()
+
+	var keySum, valSum int64
+
+	// First() + Next() traversal
+	for ok := it.First(); ok; ok = it.Next() {
+		ik := it.Key()
+		val := it.Value()
+		entriesTotal++
+
+		// Parse internal key to check type (val/del)
+		if _, _, kt, perr := parseInternalKey(ik); perr == nil {
+			switch kt {
+			case keyTypeVal:
+				entriesVal++
+				valSum += int64(len(val))
+			case keyTypeDel:
+				entriesDel++
+			default:
+				// Ignore unknown; or track if you want
+			}
+		} else {
+			// If parse fails, still count in total; you may record an error
+			if iterErr == nil {
+				iterErr = perr
+			}
+		}
+
+		keySum += int64(len(ik)) // length includes trailer; OK for average
+	}
+	if e := it.Error(); e != nil && iterErr == nil {
+		iterErr = e
+	}
+
+	if entriesTotal > 0 {
+		avgKey = keySum / entriesTotal
+		// avg value only on value-entries to avoid bias from deletions
+		if entriesVal > 0 {
+			avgVal = valSum / entriesVal
+		}
+	}
+	return
+}
+
+// collectOneTable gathers TableStats for a single tFile.
+func (v *version) collectOneTable(level int, t *tFile, ro *opt.ReadOptions) TableStats {
+	now := time.Now().Unix()
+
+	entriesTotal, entriesVal, entriesDel, avgKey, avgVal, iterErr := v.scanTable(t, ro)
+
+	ts := TableStats{
+		Level:           level,
+		FileNum:         t.fd.Num,
+		FileSizeBytes:   t.size,
+		MinUserKeyHex:   hexify(t.imin.ukey()),
+		MaxUserKeyHex:   hexify(t.imax.ukey()),
+		EntriesTotal:    entriesTotal,
+		EntriesVal:      entriesVal,
+		EntriesDel:      entriesDel,
+		AvgKeyLen:       avgKey,
+		AvgValueLen:     avgVal,
+		CollectedAtUnix: now,
+	}
+
+	if iterErr != nil {
+		ts.IterError = iterErr.Error()
+	}
+	return ts
+}
+
+// CollectSSTStats builds the in-memory snapshot of all levels & tables.
+// WARNING: This will iterate over every SST; on large DBs it can be expensive.
+func (v *version) CollectSSTStats(ro *opt.ReadOptions) (*VersionStats, error) {
+	if v == nil || v.s == nil {
+		return nil, errors.New("nil version or session")
+	}
+	out := &VersionStats{}
+
+	for level, tables := range v.levels {
+		if len(tables) == 0 {
+			continue
+		}
+		var lvlMin, lvlMax []byte
+		var lvlTotal, lvlVal, lvlDel int64
+
+		for _, t := range tables {
+			// Aggregate level-wide range
+			lvlMin, lvlMax = v.mergeLevelRange(level, lvlMin, lvlMax, t)
+
+			// Per-table stats
+			ts := v.collectOneTable(level, t, ro)
+			out.Tables = append(out.Tables, ts)
+			lvlTotal += ts.EntriesTotal
+			lvlVal += ts.EntriesVal
+			lvlDel += ts.EntriesDel
+		}
+
+		out.Levels = append(out.Levels, LevelStats{
+			Level:         level,
+			SSTCount:      len(tables),
+			MinUserKeyHex: hexify(lvlMin),
+			MaxUserKeyHex: hexify(lvlMax),
+			EntriesTotal:  lvlTotal,
+			EntriesVal:    lvlVal,
+			EntriesDel:    lvlDel,
+		})
+	}
+	return out, nil
 }
 
 type tablesScratch struct {

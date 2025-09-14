@@ -8,6 +8,7 @@ package leveldb
 
 import (
 	"container/list"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"

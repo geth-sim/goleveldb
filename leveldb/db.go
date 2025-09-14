@@ -772,6 +772,7 @@ func ResetCacheStat(startBlockNum uint64)           {}
 func PrintTotalCacheStat()                          {}
 func SaveCacheLogs(filePath, fileNamePrefix string) {}
 func PrintReadStats()                               {}
+func (db *DB) CollectSSTStats(filePath string)      {}
 
 func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.ReadOptions) (value []byte, err error) {
 	ikey := makeInternalKey(nil, key, seq, keyTypeSeek)

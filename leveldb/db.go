@@ -965,6 +965,12 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 	}
 
 	v := db.s.version()
+
+	// to get SST statistics (jmlee)
+	// fmt.Println("Inspect start!")
+	// _, _ = v.InspectAllSSTBlocks(ro, 0, 0)
+	// os.Exit(1)
+	
 	value, cSched, err := v.get(auxt, ikey, ro, false)
 	v.release()
 	if cSched {
